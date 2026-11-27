@@ -1,0 +1,163 @@
+# Keep the fork up to date with mgba-emu/mgba, without rewriting history.
+#
+# Daily, and by hand: fast-forward `master` to upstream master (never forced; refuses if
+# `master` has diverged), merge it into `remote` with a merge commit, and call build-linux.yml
+# for the new head of `remote`. On a conflict nothing is pushed to `remote`: the run opens or
+# updates the one issue "Upstream merge conflict" and fails.
+#
+# Approaches considered (details: docs/joypad/README.md, section "Staying up to date")
+#
+# | Decision        | Options                                                      | Choice              |
+# |-----------------|--------------------------------------------------------------|---------------------|
+# | Sync mechanism  | plain git in a scheduled workflow; merge-upstream REST API;   | plain git, daily    |
+# |                 | Marketplace sync action; the Pull app; "Sync fork" button;    | workflow, plus      |
+# |                 | local systemd timer running joypad/sync.sh                    | joypad/sync.sh      |
+# | Carrying changes| merge commits on `remote`; patch series rebased on upstream  | merge commits       |
+# | Token           | GITHUB_TOKEN; personal access token with `workflow` scope    | GITHUB_TOKEN        |
+# | Conflicts       | one issue, updated; a new issue each day; failed run only    | one issue + failure |
+#
+# Why not merge-upstream: on a branch that has diverged it answers merge_type "merge" and
+# writes a merge commit, which `master` must never get. A `git push` without --force can only
+# fast-forward. The Pull app opens pull requests or hard-resets (a force-push). A patch series
+# would have to be rebased and force-pushed on `remote` each time upstream moves.
+
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "37 5 * * *"
+  workflow_dispatch:
+    inputs:
+      master_branch:
+        description: Branch kept equal to upstream master (tests use test/sync-master)
+        type: string
+        default: master
+      remote_branch:
+        description: Branch upstream is merged into (tests use test/sync-remote)
+        type: string
+        default: remote
+
+permissions: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+    concurrency:
+      group: sync-upstream
+      cancel-in-progress: false
+    outputs:
+      merged: ${{ steps.sync.outputs.merged }}
+    env:
+      MASTER: ${{ inputs.master_branch || 'master' }}
+      REMOTE: ${{ inputs.remote_branch || 'remote' }}
+      UPSTREAM_URL: https://github.com/mgba-emu/mgba.git
+      ISSUE_TITLE: Upstream merge conflict
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.REMOTE }}
+          fetch-depth: 0
+
+      - name: Sync
+        id: sync
+        run: |
+          set -euo pipefail
+          summary() { echo "$*" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          echo "merged=false" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --no-tags origin "+refs/heads/$MASTER:refs/remotes/origin/$MASTER" "+refs/heads/$REMOTE:refs/remotes/origin/$REMOTE"
+          git fetch --no-tags "$UPSTREAM_URL" "+master:refs/remotes/upstream/master"
+          up=$(git rev-parse refs/remotes/upstream/master)
+          master=$(git rev-parse "refs/remotes/origin/$MASTER")
+          remote=$(git rev-parse "refs/remotes/origin/$REMOTE")
+          summary "upstream master \`$up\`, $MASTER \`$master\`, $REMOTE \`$remote\`"
+
+          # 1. master: fast-forward only.
+          if ! git merge-base --is-ancestor "$master" "$up"; then
+            summary "::error::$MASTER has commits that are not in upstream master. It is not changed; fix it by hand (see docs/joypad/README.md)."
+            exit 1
+          fi
+          if [ "$master" != "$up" ]; then
+            git push origin "$up:refs/heads/$MASTER"
+            summary "$MASTER fast-forwarded by $(git rev-list --count "$master..$up") commits."
+          else
+            summary "$MASTER is already equal to upstream master."
+          fi
+
+          # 2. remote: merge upstream if it is not already in.
+          if git merge-base --is-ancestor "$up" "$remote"; then
+            summary "$REMOTE already contains upstream master: nothing to do."
+            exit 0
+          fi
+          base=$(git merge-base "$up" "$remote")
+          workflow_changes=$(git diff --name-only "$base" "$up" -- .github/workflows)
+          if [ -n "$workflow_changes" ]; then
+            summary "::error::Upstream changed files under .github/workflows/, which GITHUB_TOKEN may not push:"
+            summary '```'; summary "$workflow_changes"; summary '```'
+            summary "Run joypad/sync.sh on your machine (it pushes with your own login), or add a fine-grained token with Contents and Workflows write access as a secret and use it in this workflow."
+            exit 1
+          fi
+
+          git switch --force-create "$REMOTE" "$remote"
+          count=$(git rev-list --count "$remote..$up")
+          if git merge --no-ff --no-edit -m "Merge upstream master ($(git rev-parse --short "$up")) into $REMOTE" "$up"; then
+            git push origin "HEAD:refs/heads/$REMOTE"
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            summary "Merged $count upstream commits into $REMOTE: \`$(git rev-parse HEAD)\`."
+            open=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number,title \
+                     --jq "[.[] | select(.title == \"$ISSUE_TITLE\")][0].number // empty")
+            if [ -n "$open" ]; then
+              gh issue close "$open" --comment "Resolved: upstream \`$up\` merged into \`$REMOTE\` cleanly by run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+            fi
+            exit 0
+          fi
+
+          # 3. Conflict: push nothing, report in one issue, fail.
+          files=$(git diff --name-only --diff-filter=U)
+          git merge --abort
+          {
+            echo "The daily sync could not merge upstream \`mgba-emu/mgba\` master into \`$REMOTE\`. Nothing was pushed to \`$REMOTE\`; \`$MASTER\` was fast-forwarded."
+            echo
+            echo "- Upstream master: \`$up\`"
+            echo "- \`$REMOTE\`: \`$remote\`"
+            echo "- Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "### Conflicting files"
+            echo
+            echo "$files" | sed 's/^/- `/; s/$/`/'
+            echo
+            echo "### Upstream commits not yet in \`$REMOTE\` ($count)"
+            echo
+            git log --format='- %h %s' "$remote..$up" | head -n 100
+            echo
+            echo "To resolve by hand: run \`joypad/sync.sh\`, fix the files it lists, \`git commit\`, \`git push origin $REMOTE\`. See docs/joypad/README.md, \"Staying up to date\". The next clean sync closes this issue."
+          } > "$RUNNER_TEMP/issue.md"
+          existing=$(gh issue list --state open --search "in:title \"$ISSUE_TITLE\"" --json number,title \
+                       --jq "[.[] | select(.title == \"$ISSUE_TITLE\")][0].number // empty")
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body-file "$RUNNER_TEMP/issue.md"
+            gh issue comment "$existing" --body "Still conflicting at upstream \`$up\` (run $GITHUB_RUN_ID)."
+            summary "Updated issue #$existing."
+          else
+            url=$(gh issue create --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/issue.md")
+            summary "Opened $url."
+          fi
+          summary "::error::Merge conflict in: $(echo $files)"
+          exit 1
+
+  build:
+    needs: sync
+    # Only the real branch gets a release; the conflict test runs on throwaway branches.
+    if: needs.sync.outputs.merged == 'true' && (inputs.remote_branch || 'remote') == 'remote'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-linux.yml
+    with:
+      ref: remote

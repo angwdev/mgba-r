@@ -98,11 +98,11 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
-          # Release tags (remote-<sha>) would turn the version string into the tag name.
           # Upstream's release tags: the Qt CMakeLists.txt builds the AppStream release list
           # from them and fails without any. They are lightweight, so the version is unchanged.
           git fetch --no-tags https://github.com/mgba-emu/mgba.git \
             '+refs/tags/*:refs/tags/*' '+master:refs/remotes/upstream/master'
+          # The fork's release tags (remote-<sha>) would turn the version string into the tag.
           git tag -l 'remote-*' | xargs -r git tag -d >/dev/null
           echo "branch=$(git symbolic-ref --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -166,7 +166,8 @@ jobs:
           SHA: ${{ steps.src.outputs.sha }}
           UPSTREAM: ${{ steps.src.outputs.upstream }}
         run: |
-          version="$(head -n1 "$RUNNER_TEMP/version.txt")"
+          # mgba-qt prints its own path first; keep "<version> (<commit>)".
+          version="$(head -n1 "$RUNNER_TEMP/version.txt" | cut -d' ' -f2-)"
           cat > "$ROOT/BUILDINFO" <<EOF
           tag=$TAG
           fork_commit=$SHA
