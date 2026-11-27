@@ -37,6 +37,7 @@ on:
       - "docs/**"
       - "joypad/**"
       - "**.md"
+      - ".github/workflows/sync-upstream.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -98,8 +99,11 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
           # Release tags (remote-<sha>) would turn the version string into the tag name.
+          # Upstream's release tags: the Qt CMakeLists.txt builds the AppStream release list
+          # from them and fails without any. They are lightweight, so the version is unchanged.
+          git fetch --no-tags https://github.com/mgba-emu/mgba.git \
+            '+refs/tags/*:refs/tags/*' '+master:refs/remotes/upstream/master'
           git tag -l 'remote-*' | xargs -r git tag -d >/dev/null
-          git fetch --no-tags https://github.com/mgba-emu/mgba.git master:refs/remotes/upstream/master
           echo "branch=$(git symbolic-ref --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short=9 HEAD)" >> "$GITHUB_OUTPUT"
