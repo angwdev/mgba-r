@@ -1,6 +1,7 @@
 # mgba-r: plan for the joypad-mcp remote
 
-Status: **design only, waiting for the owner's approval.** Nothing in this plan is built yet.
+Status: **design approved by the owner on 2026-11-27**, with the answers recorded in
+[Decisions](#decisions-2026-11-27). Nothing in this plan is built yet.
 
 Written 2026-11-27 against `remote` at `89b61cf33`, which is upstream `c4fe856f2` plus the
 fork's CI. Every claim about mGBA cites a file and a function at that commit. Line numbers
@@ -158,8 +159,8 @@ they are listed in [Spec changes to propose](#spec-changes-to-propose).
 - Lua bindings for pause and fast-forward.
 
 Upstream's maintainer wrote on PR #3752 (closed): "We do not accept code written by LLMs."
-So nothing from this fork should be offered unless the owner writes it themselves. Upstream
-is not contacted.
+So nothing from this fork is offered. The owner decided the fork's copy is enough, and no
+piece is set aside for upstream (decision 10). Upstream is not contacted.
 
 ### Holding the game: take, run, release
 
@@ -201,7 +202,7 @@ Owner menu actions that change the game (reset, load state, rewind), used *durin
 request, would run between two agent frames. That is also true today: the bridge's `hold()`
 returns between `run`s, and a pending interrupt runs then. The fork keeps that behaviour in
 this plan and reports it, so nothing regresses. Deferring such actions until `release` would
-need a hook in `Window::addGameAction`; that is an open question.
+need a hook in `Window::addGameAction`; the owner chose not to add it (decision 7).
 
 ---
 
@@ -287,7 +288,7 @@ program.
   constructed", which is why the hook sits in `main.cpp` and not in `GBAApp.cpp`. Every file
   dialog is then Qt's own widget dialog. Started by hand, nothing changes.
 - The agent's keys to a `QFileDialog` are refused, except Escape, so that no file outside
-  joypad-mcp's paths can be chosen (FR-217). This is an open question.
+  joypad-mcp's paths can be chosen (FR-217). Decided (decision 5).
 
 **Never move the owner's focus.**
 
@@ -298,8 +299,10 @@ program.
 - The fork never calls `raise()`, `activateWindow()` or `requestActivate()`.
 - `status` reports `focus=1` when any fork window is active. SC-207 and SC-212 check exactly
   that.
-- Whether the game window itself should open without activation is an open question: it
-  changes what the owner sees at load.
+- The game window itself also opens without activation when joypad-mcp starts the fork
+  (decision 1): the fork sets `WA_ShowWithoutActivating` on the main window before it is
+  first shown. The owner clicks the window to play. Started by hand, it takes focus as stock
+  mGBA does.
 
 ---
 
@@ -429,7 +432,8 @@ Three facts found while reading, for joypad-mcp:
   `ConfigController::setOption`). If the owner presses OK in Settings while joypad-mcp runs,
   the `-C` folder paths can be written into the owner's `config.ini`. This is stock behaviour.
   The fork refuses the `settings` action for the agent, but cannot stop the owner without
-  changing upstream code. It is an open question.
+  changing upstream code. The owner keeps sharing `~/.config/mgba` and accepts this risk
+  (decision 3).
 - **Recordings and state files the owner picks by hand go where the owner points the file
   dialog.** That is the owner's choice, and the agent cannot open those dialogs (section
   "Program actions").
@@ -477,8 +481,10 @@ byte-compatible with stock mGBA's.
 - A state taken in one and replayed in the other can then diverge, or be refused.
 - This may also explain the unexplained FireRed pixel differences from frame 500 on
   (`HANDOFF.md`: not checked).
-- Setting the BIOS the same way in both modes is an open question for the owner, because it
-  changes the owner's game (boot logo, BIOS timing).
+- Decided (decision 4): joypad-mcp pins the built-in BIOS in both modes, `-C useBios=0`
+  for the window and the libretro core's built-in BIOS for the mode without a window. The
+  owner has no GBA BIOS file set (`gba.bios` is empty in `config.ini`), so the window already
+  runs the built-in BIOS today and nothing visible changes.
 
 ---
 
@@ -512,6 +518,7 @@ byte-compatible with stock mGBA's.
   3. It also asserts the compositor never activated a fork window: weston's debug log, or
      KWin's `activeWindow`.
 - None of this shows on the owner's desktop: the compositor has no output.
+- The weston job runs on every push to `remote` (decision 9), beside the build.
 
 **Tests on the fork's side.**
 
@@ -938,38 +945,25 @@ Already true today, and worth noting in the spec:
 
 ---
 
-## Open questions
+## Decisions (2026-11-27)
 
-1. **Focus at load.** Should the game window open without taking focus when joypad-mcp
-   starts mgba-r (`WA_ShowWithoutActivating` on the main window too)? Recommended: yes. You
-   then click the window to play, and your focused program keeps the keyboard even at load.
-   Today, stock mGBA takes focus when `load_rom` opens it.
-2. **Fast-forward speed.** When joypad-mcp disconnects, should mgba-r put your
-   `fastForwardRatio` back? Recommended: yes. Otherwise the agent's last speed stays in your
-   mGBA settings, the same as if you had picked it in the menu.
-3. **Your mGBA settings folder.** Keep sharing `~/.config/mgba` with mgba-r (your keys, your
-   display, recent files in `qt.ini`)? Or give mgba-r its own settings folder inside
-   joypad-mcp's data folder (`XDG_CONFIG_HOME`)? Recommended: keep sharing, as FR-015 says,
-   with the agent refused the `settings` action. The risk: if *you* press OK in Settings
-   while joypad-mcp runs, its folder paths can be saved into your `config.ini` (stock
-   behaviour).
-4. **The BIOS for saved moments.** For moments to move between the window and the mode
-   without a window, both must use the same BIOS. Should joypad-mcp fix it, either your BIOS
-   file in both modes or the built-in BIOS in both (`-C useBios=0`, which skips the boot
-   logo)? The same goes for `-C hwaccelVideo=0` (mGBA's default) for the live view.
-5. **Keys to file dialogs.** Refuse the agent's keys to Qt's file dialogs except Escape
-   (recommended), or allow them and check the chosen path afterwards?
-6. **Game actions for the agent.** `reset`, `frameAdvance`, `loadState`, `quickLoad.*` and
-   rewind are refused for the agent, which uses joypad-mcp's own `reset`, `step` and saved
-   moments instead. Agreed?
-7. **Your menu actions during a request.** Leave them as today (they run between two agent
-   frames)? Or defer them until the request ends? Deferring needs a small hook in
-   `Window::addGameAction`, one more upstream spot. Recommended: leave them for now.
-8. **Memory watches.** Add them to the spec as a new FR (recommended), with the fork-side
-   per-frame sampling deferred?
-9. **CI with a headless Wayland compositor.** It adds a test job with weston to the fork's
-   Actions. Public-repository minutes are free, but a run takes longer. Run it on every
-   push, or only by hand and on release? Recommended: on every push to `remote`.
-10. **Upstream.** Upstream does not accept LLM-written code (PR #3752). Do you want any piece
-    (an "all actions" accessor, Lua pause and fast-forward bindings) kept aside for you to
-    write and offer yourself one day, or is the fork's copy enough?
+The owner answered the plan's open questions on 2026-11-27. Each answer is the plan's
+recommendation, except decision 10, which had none.
+
+| # | Question | Decision | What it means for the build |
+|---|---|---|---|
+| 1 | Focus at load | The game window opens **without taking focus** when joypad-mcp starts mgba-r | `WA_ShowWithoutActivating` on the main window too; the owner clicks the window to play. A copy started by hand takes focus as stock mGBA does |
+| 2 | Fast-forward speed | **Put the owner's `fastForwardRatio` back** when joypad-mcp disconnects | Read at hello, restored on disconnect (section 3) |
+| 3 | Settings folder | **Keep sharing `~/.config/mgba`** (FR-015) | The agent is refused the `settings` action. Accepted risk: if the owner presses OK in Settings during a session, joypad-mcp's `-C` folder paths can be saved into `config.ini` (stock behaviour) |
+| 4 | BIOS for saved moments | **The built-in BIOS in both modes** | joypad-mcp passes `-C useBios=0` to the window and keeps the libretro core on its built-in BIOS. No visible change: the owner has no GBA BIOS file set |
+| 5 | Keys to file dialogs | **Refused, except Escape** | The agent can only close a file dialog (FR-217) |
+| 6 | Game actions for the agent | **Refused**: `reset`, `frameAdvance`, `loadState`, `quickLoad.*`, rewind | The agent uses joypad-mcp's own `reset`, `step` and saved moments, so frame counts stay exact |
+| 7 | Owner's menu actions during a request | **Leave as today**: they run between two agent frames | No hook in `Window::addGameAction`; `status` reports it (spec Edge Cases) |
+| 8 | Memory watches | **A new FR in the spec**; fork-side per-frame sampling deferred | joypad-mcp checks watches per request; the fork's sampling stays in the work order's "later" row |
+| 9 | Headless Wayland CI | **On every push to `remote`** | A weston job beside `build-linux.yml` proves SC-207 on each build |
+| 10 | Upstream | **The fork's copy is enough**; nothing set aside | No piece is marked for upstream; upstream is not contacted |
+
+Not asked separately, and still the plan's proposal: `-C hwaccelVideo=0` for the runs
+joypad-mcp starts, for the live view ([The live view](#the-live-view), "Prerequisite"). The
+owner's own setting is `hwaccelVideo=1`, and the override applies only to the runs
+joypad-mcp starts. To confirm when the live view is built (work order step 6).
