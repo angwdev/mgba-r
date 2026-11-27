@@ -3,7 +3,7 @@
 `angwdev/mgba-r` is a fork of [mgba-emu/mgba](https://github.com/mgba-emu/mgba) (MPL 2.0)
 that joypad-mcp will drive through the program itself, without X11. This folder documents
 how the fork is built, installed and kept up to date. The design of the fork's code changes
-is in [PLAN.md](PLAN.md).
+is in [PLAN.md](PLAN.md). Where the work stands and what comes next: [HANDOFF.md](HANDOFF.md).
 
 ## Branches
 
