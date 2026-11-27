@@ -1,0 +1,221 @@
+# Build mgba-qt for Arch Linux (x86_64) and publish it as a GitHub release.
+#
+# Runs on every push to `remote`, by hand (workflow_dispatch), and when sync-upstream.yml
+# calls it after merging upstream (a push made with GITHUB_TOKEN does not trigger `push`).
+#
+# Approaches considered (details: docs/joypad/README.md, section "Build")
+#
+# | Decision          | Options                                                  | Choice                    |
+# |-------------------|----------------------------------------------------------|---------------------------|
+# | Build environment | archlinux:latest container; Ubuntu + AppImage; Flatpak;  | archlinux:latest          |
+# |                   | PKGBUILD built in CI into a pacman package                | container                 |
+# | Build options     | AUR mgba-git options; upstream buildbot options          | AUR options + a relative  |
+# |                   |                                                          | DATADIR, RPATH $ORIGIN    |
+# | Relocation        | patchelf RUNPATH; wrapper with LD_LIBRARY_PATH; static   | patchelf                  |
+# |                   | libmgba (BUILD_SHARED=OFF)                               |                           |
+# | Cache             | ccache via actions/cache; cached pacman packages; none   | ccache                    |
+# | Publishing        | GitHub release per build; Actions artifacts only         | release, newest 10 kept   |
+#
+# Why the Arch container: it links against the same libraries (Qt 6, Lua, ffmpeg) as the
+# owner's machine and the AUR package mgba-qt-git, which is the build the owner runs today.
+# Upstream's own Linux builds work the same way: one distro container per target
+# (mgba-emu/mgba-infrastructure, buildbot/builders.yml). The cost is that an Arch library
+# soname bump (for example ffmpeg or Lua) breaks an old build; joypad/install.sh checks
+# `ldd` for that, and the next push or daily sync rebuilds against the new libraries.
+# AppImage (kept as a note, not a job): portable across distributions and immune to Arch
+# updates, but it bundles Qt and ffmpeg (around 80-100 MB), needs linuxdeploy and an old
+# Ubuntu base, and is unlike what the owner runs. Flatpak: Flathub's io.mgba.mGBA builds
+# release 0.10.5 on the Qt 5 KDE runtime in a sandbox, which would hide joypad-mcp's
+# environment variables and folders. A pacman package would need root to install.
+
+name: build-linux
+
+on:
+  push:
+    branches: [remote]
+    paths-ignore:
+      - "docs/**"
+      - "joypad/**"
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to build
+        type: string
+        default: remote
+  workflow_call:
+    inputs:
+      ref:
+        description: Branch to build
+        type: string
+        default: remote
+
+permissions:
+  contents: write
+
+env:
+  # The AUR mgba-git options, plus a data folder relative to the program so the archive
+  # runs from any folder (src/platform/qt/GBAApp.cpp, GBAApp::dataDir).
+  CMAKE_OPTIONS: >-
+    -G Ninja
+    -DCMAKE_INSTALL_LIBDIR=lib
+    -DCMAKE_INSTALL_PREFIX=/usr
+    -DCMAKE_BUILD_TYPE=Release
+    -DUSE_MINIZIP=OFF
+    -DDATADIR=../share/mgba
+  KEEP_RELEASES: 10
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 60
+    concurrency:
+      group: build-linux-${{ inputs.ref || github.ref_name }}
+      cancel-in-progress: false
+    env:
+      BUILD_REF: ${{ inputs.ref || github.ref_name }}
+      CCACHE_MAXSIZE: 500M
+    steps:
+      - name: Install build dependencies
+        # git first, so actions/checkout makes a real clone (version.cmake reads the branch
+        # name and the commit count from it).
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git cmake ninja ccache patchelf github-cli zstd \
+            ffmpeg json-c libedit libelf libepoxy libglvnd libpng libzip lua sqlite zlib \
+            sdl2 qt6-base qt6-multimedia qt6-tools
+
+      - name: Check out ${{ env.BUILD_REF }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BUILD_REF }}
+          fetch-depth: 0
+
+      - name: Describe the source
+        id: src
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache" >> "$GITHUB_ENV"
+          # Release tags (remote-<sha>) would turn the version string into the tag name.
+          git tag -l 'remote-*' | xargs -r git tag -d >/dev/null
+          git fetch --no-tags https://github.com/mgba-emu/mgba.git master:refs/remotes/upstream/master
+          echo "branch=$(git symbolic-ref --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=9 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git merge-base HEAD refs/remotes/upstream/master)" >> "$GITHUB_OUTPUT"
+          echo "tag=remote-$(git rev-parse --short=9 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-arch-${{ github.run_id }}
+          restore-keys: ccache-arch-
+
+      - name: Configure
+        run: cmake -S . -B build $CMAKE_OPTIONS -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        run: |
+          ccache -z
+          cmake --build build
+          ccache -s
+
+      - name: Stage
+        env:
+          TAG: ${{ steps.src.outputs.tag }}
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          rm -rf "$stage"
+          for component in libmgba mgba-qt; do
+            DESTDIR="$stage" cmake --install build --component "$component"
+          done
+          # DATADIR is relative to the program (../share/mgba) but install() reads it
+          # relative to the prefix, so the data lands beside /usr: move it under it.
+          mkdir -p "$stage/usr/share"
+          mv "$stage/share/mgba" "$stage/usr/share/mgba"
+          rmdir "$stage/share"
+          # CMakeLists.txt sets no RPATH for prefix /usr: point the program at its own libmgba.
+          patchelf --set-rpath '$ORIGIN/../lib' "$stage/usr/bin/mgba-qt"
+          install -Dm644 LICENSE "$stage/usr/share/licenses/mgba-r/LICENSE"
+          mv "$stage/usr" "$RUNNER_TEMP/$TAG"
+          echo "ROOT=$RUNNER_TEMP/$TAG" >> "$GITHUB_ENV"
+          find "$RUNNER_TEMP/$TAG" -maxdepth 3 | sort
+
+      - name: Smoke check
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          bin="$ROOT/bin/mgba-qt"
+          if ldd "$bin" | grep 'not found'; then exit 1; fi
+          ldd "$bin" | grep libmgba | grep -q "$ROOT/" || { echo "libmgba is not the bundled one"; ldd "$bin"; exit 1; }
+          "$bin" --version | tee "$RUNNER_TEMP/version.txt"
+          "$bin" --help | tee "$RUNNER_TEMP/help.txt"
+          grep -q -- '--script' "$RUNNER_TEMP/help.txt"
+          test -f "$ROOT/share/mgba/nointro.dat"
+          test -d "$ROOT/share/mgba/scripts"
+
+      - name: Package
+        env:
+          TAG: ${{ steps.src.outputs.tag }}
+          SHA: ${{ steps.src.outputs.sha }}
+          UPSTREAM: ${{ steps.src.outputs.upstream }}
+        run: |
+          version="$(head -n1 "$RUNNER_TEMP/version.txt")"
+          cat > "$ROOT/BUILDINFO" <<EOF
+          tag=$TAG
+          fork_commit=$SHA
+          upstream_commit=$UPSTREAM
+          version=$version
+          cmake_options=$CMAKE_OPTIONS
+          built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          packages=$(pacman -Q qt6-base qt6-multimedia lua ffmpeg sdl2 libzip | tr '\n' ' ')
+          EOF
+          sed -i 's/^ *//' "$ROOT/BUILDINFO"
+          mkdir -p dist
+          archive="mgba-r-$TAG-linux-x86_64.tar.zst"
+          tar -C "$RUNNER_TEMP" -cf - "$TAG" | zstd -19 -T0 -o "dist/$archive"
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
+          cat dist/SHA256SUMS
+          ls -l dist
+          {
+            echo "Linux build of the fork, branch \`$BUILD_REF\`. Built for Arch Linux x86_64 in an \`archlinux:latest\` container."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Fork commit | \`$SHA\` |"
+            echo "| Upstream commit | \`$UPSTREAM\` (\`git merge-base\` with \`mgba-emu/mgba\` master) |"
+            echo "| Version | \`$version\` |"
+            echo "| CMake options | \`$CMAKE_OPTIONS\` |"
+            echo "| Built against | \`$(pacman -Q qt6-base lua ffmpeg | tr '\n' ' ')\` |"
+            echo
+            echo "Install: \`joypad/install.sh\` (see \`docs/joypad/README.md\`)."
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.src.outputs.tag }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          if gh release view "$TAG" -R "$repo" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$repo"
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest -R "$repo"
+          else
+            gh release create "$TAG" dist/* -R "$repo" --target "$SHA" \
+              --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" --latest
+          fi
+
+      - name: Keep the newest ${{ env.KEEP_RELEASES }} releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          gh release list -R "$repo" --limit 200 --json tagName,createdAt \
+            --jq '(env.KEEP_RELEASES | tonumber) as $n | [.[] | select(.tagName | startswith("remote-"))] | sort_by(.createdAt) | reverse | .[$n:] | .[].tagName' |
+          while read -r old; do
+            echo "Deleting $old"
+            gh release delete "$old" -R "$repo" --yes --cleanup-tag
+          done
