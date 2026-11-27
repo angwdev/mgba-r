@@ -104,6 +104,12 @@ jobs:
             '+refs/tags/*:refs/tags/*' '+master:refs/remotes/upstream/master'
           # The fork's release tags (remote-<sha>) would turn the version string into the tag.
           git tag -l 'remote-*' | xargs -r git tag -d >/dev/null
+          # A push builds the commit that was pushed, even if the branch has moved on since
+          # (the sync may push a merge meanwhile). Calls and dispatches build the branch head.
+          # Either way HEAD stays on a branch named $BUILD_REF, which version.cmake reads.
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            git checkout -q -B "$BUILD_REF" "$GITHUB_SHA"
+          fi
           echo "branch=$(git symbolic-ref --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git rev-parse --short=9 HEAD)" >> "$GITHUB_OUTPUT"
